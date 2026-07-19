@@ -4,7 +4,7 @@
   "editor": "wokwi",
   "parts": [
     { "type": "board-esp32-devkit-c-v4", "id": "esp", "top": 0, "left": 0, "attrs": {} },
-    { "type": "board-mpu6050", "id": "imu1", "top": 20, "left": 150, "attrs": {} },
+    { "type": "wokwi-mpu6050", "id": "imu1", "top": 20, "left": 150, "attrs": {} },
     { "type": "wokwi-pushbutton", "id": "btn1", "top": 120, "left": 150, "attrs": { "color": "red" } }
   ],
   "connections": [

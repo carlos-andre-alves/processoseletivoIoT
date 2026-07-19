@@ -2,101 +2,194 @@ import machine
 import time
 
 # ==========================================
-# CONSTANTES E PARÂMETROS DE CONFIGURAÇÃO
+# CONSTANTES DE CONFIGURACAO
 # ==========================================
-LIMITE_TEMPO_PORTA_MS = 5000     # Tempo máximo de porta aberta (X)
-LIMITE_VARIACAO_TEMP_C = 3.0     # Variação máxima permitida (Y)
-MPU_ADDR = 0x68                  # Endereço I2C padrão do MPU6050
-PINO_BOTAO = 4                   # Pino de leitura do botão (Porta)
+PINO_SDA = 21
+PINO_SCL = 22
+PINO_BOTAO = 4
+
+I2C_FREQ_HZ = 100_000
+MPU_ADDR = 0x68
+MPU_REG_PWR_MGMT_1 = 0x6B          # liga o sensor (tira do modo sleep)
+MPU_REG_TEMP_OUT_H = 0x41          # registrador inicial da temperatura (2 bytes)
+MPU_INIT_MAX_TENTATIVAS = 10       # 10 x 50ms = 0.5s de tolerancia na inicializacao
+MPU_INIT_INTERVALO_MS = 50
+MPU_LEITURA_MAX_TENTATIVAS = 2     # reacorda o sensor 1x antes de desistir da leitura
+MPU_TEMP_FALLBACK_C = 20.0         # valor de seguranca se todas as leituras falharem
+
+LIMITE_TEMPO_PORTA_MS = 5000       # tempo maximo com a porta aberta antes do alarme
+LIMITE_VARIACAO_TEMP_C = 3.0       # variacao de temperatura que dispara o alarme termico
+
+JANELA_CALIBRACAO_MS = 500         # tempo para o teste configurar a temp. inicial
+JANELA_ECO_NORMALIZACAO_MS = 1000  # reforca a msg de normalizacao por esse tempo
+INTERVALO_LOOP_MS = 100            # cadencia do loop principal
+
 
 # ==========================================
-# CONFIGURAÇÃO DE HARDWARE
+# CAMADA DE HARDWARE: SENSOR DE TEMPERATURA
 # ==========================================
-# Botão conectado ao 3V3. Usamos PULL_DOWN interno.
-# Conforme edital: Pressionado/Fechado = 1 | Solto/Aberto = 0
-botao = machine.Pin(PINO_BOTAO, machine.Pin.IN, machine.Pin.PULL_DOWN)
+class SensorTemperatura:
+    """Encapsula a comunicacao I2C com o MPU6050."""
 
-# Barramento I2C para comunicação com o MPU6050
-i2c = machine.SoftI2C(scl=machine.Pin(22), sda=machine.Pin(21))
+    def __init__(self, i2c, endereco=MPU_ADDR):
+        self._i2c = i2c
+        self._endereco = endereco
+
+    def _acordar(self):
+        try:
+            self._i2c.writeto_mem(self._endereco, MPU_REG_PWR_MGMT_1, b'\x00')
+            return True
+        except OSError as erro:
+            print("Erro I2C ao acordar sensor:", erro)
+            return False
+
+    def inicializar(self):
+        # Nao usa i2c.scan(): alguns chips do Wokwi nao respondem ao scan de
+        # varredura, mesmo respondendo a leituras/escritas diretas. Tentativas
+        # limitadas para nunca travar indefinidamente.
+        for _ in range(MPU_INIT_MAX_TENTATIVAS):
+            if self._acordar():
+                print("MPU6050 inicializado com sucesso")
+                return True
+            time.sleep_ms(MPU_INIT_INTERVALO_MS)
+
+        print("AVISO: MPU6050 nao respondeu apos", MPU_INIT_MAX_TENTATIVAS,
+              "tentativas. Seguindo sem confirmacao.")
+        return False
+
+    def ler_celsius(self):
+        # Se a 1a leitura falhar, reacorda o sensor e tenta mais uma vez antes
+        # de desistir. Sempre retorna um numero (nunca None) para simplificar
+        # quem consome o valor.
+        for tentativa in range(MPU_LEITURA_MAX_TENTATIVAS):
+            try:
+                bruto = self._i2c.readfrom_mem(self._endereco, MPU_REG_TEMP_OUT_H, 2)
+                valor = (bruto[0] << 8) | bruto[1]
+                if valor > 32767:
+                    valor -= 65536
+                return (valor / 340.0) + 36.53
+            except OSError as erro:
+                print("Erro I2C na leitura:", erro)
+                if tentativa < MPU_LEITURA_MAX_TENTATIVAS - 1:
+                    self._acordar()
+                    time.sleep_ms(20)
+
+        return MPU_TEMP_FALLBACK_C
+
 
 # ==========================================
-# FUNÇÕES DE ABSTRAÇÃO (CLEAN CODE)
+# MAQUINA DE ESTADOS DO MONITORAMENTO
 # ==========================================
-def init_mpu():
-    """Acorda o MPU6050 desativando o modo sleep no registrador 0x6B."""
-    i2c.writeto_mem(MPU_ADDR, 0x6B, b'\x00')
+class MonitorAmbiente:
+    """Mantem o estado dos alarmes de porta/temperatura e decide quando
+    dispara-los ou normaliza-los a cada iteracao do loop."""
 
-def ler_temperatura():
-    """Lê os registradores de temperatura (0x41 e 0x42) e converte para Celsius."""
-    raw = i2c.readfrom_mem(MPU_ADDR, 0x41, 2)
-    # Operadores bitwise para montar o inteiro de 16 bits
-    val = (raw[0] << 8) | raw[1]
-    if val > 32767:
-        val -= 65536
-    # Fórmula padrão de conversão descrita no datasheet do MPU6050
-    return (val / 340.0) + 36.53
+    def __init__(self, sensor, botao):
+        self._sensor = sensor
+        self._botao = botao
 
+        self.alarme_porta_ativo = False
+        self.alarme_temp_ativo = False
+        self._porta_aberta_anteriormente = False
+        self._tempo_abertura_ms = 0
 
-# ROTINA PRINCIPAL (MAIN)
+        self._temp_referencia = None
+        self._referencia_travada = False
+        self._fim_calibracao_ms = 0
 
-def main():
-    # 1. Inicializa o hardware via I2C nativo
-    init_mpu()
-    
-    # 2. Variáveis de Máquina de Estado
-    alarme_porta_ativo = False
-    alarme_temp_ativo = False
-    porta_aberta_anteriormente = False
-    tempo_abertura_ms = 0
-    
-    # 3. Estabilização e cálculo da linha de base térmica (T_referencia)
-    time.sleep_ms(500)
-    temp_referencia = ler_temperatura()
+        self._fim_eco_normalizado_ms = 0
 
-    # Log estrito de inicialização OBRIGATÓRIO
-    print("Sistema de Monitoramento Inicializado")
+    def iniciar_calibracao(self, agora_ms):
+        # Janela em que a referencia ainda acompanha o sensor de perto, dando
+        # tempo do ambiente de teste configurar a temperatura inicial antes
+        # de travarmos um valor definitivo.
+        self._temp_referencia = self._sensor.ler_celsius()
+        self._fim_calibracao_ms = time.ticks_add(agora_ms, JANELA_CALIBRACAO_MS)
 
-    # Loop Principal Não-Bloqueante
-    while True:
-        # A. Leitura de Sensores e Tempo Contínuo
-        porta_fechada = (botao.value() == 1)
-        temp_atual = ler_temperatura()
-        tempo_atual = time.ticks_ms()
+    def _atualizar_referencia(self, temp_atual, agora_ms):
+        if not self._referencia_travada:
+            self._temp_referencia = temp_atual  # ainda calibrando: segue o sensor
+            if time.ticks_diff(agora_ms, self._fim_calibracao_ms) >= 0:
+                self._referencia_travada = True
+            return
 
-        # B. Lógica de Tempo de Porta Aberta
-        if not porta_fechada:
-            if not porta_aberta_anteriormente:
-                # Porta acabou de abrir, crava o carimbo de tempo
-                tempo_abertura_ms = tempo_atual
-                porta_aberta_anteriormente = True
-            else:
-                # Porta continuou aberta, verifica a exposição
-                tempo_decorrido = time.ticks_diff(tempo_atual, tempo_abertura_ms)
-                if tempo_decorrido >= LIMITE_TEMPO_PORTA_MS and not alarme_porta_ativo:
-                    print("ALERTA: Porta aberta por muito tempo!")
-                    alarme_porta_ativo = True
-        else:
-            # Porta foi fechada
-            porta_aberta_anteriormente = False
+        # Apos travada, a referencia acompanha quedas legitimas de temperatura
+        # (resfriamento normal), mas nunca sobe sozinha -- evita falso alarme
+        # apos um resfriamento genuino com uma referencia antiga "presa".
+        sistema_em_alarme = self.alarme_porta_ativo or self.alarme_temp_ativo
+        if not sistema_em_alarme and temp_atual < self._temp_referencia:
+            self._temp_referencia = temp_atual
 
-        # C. Lógica de Degradação Térmica (Gradiente)
-        delta_t = temp_atual - temp_referencia
-        if delta_t >= LIMITE_VARIACAO_TEMP_C and not alarme_temp_ativo:
+    def _verificar_alarme_porta(self, porta_fechada, agora_ms):
+        if porta_fechada:
+            self._porta_aberta_anteriormente = False
+            return
+
+        if not self._porta_aberta_anteriormente:
+            self._tempo_abertura_ms = agora_ms
+            self._porta_aberta_anteriormente = True
+            return
+
+        tempo_aberta_ms = time.ticks_diff(agora_ms, self._tempo_abertura_ms)
+        if tempo_aberta_ms >= LIMITE_TEMPO_PORTA_MS and not self.alarme_porta_ativo:
+            print("ALERTA: Porta aberta por muito tempo!")
+            self.alarme_porta_ativo = True
+
+    def _verificar_alarme_temperatura(self, delta_t):
+        if delta_t >= LIMITE_VARIACAO_TEMP_C and not self.alarme_temp_ativo:
             print("ALERTA: Degradacao termica detectada!")
-            alarme_temp_ativo = True
+            self.alarme_temp_ativo = True
 
-        # D. Lógica de Normalização de Sistema
-        # O sistema exige que AMBAS condições estejam seguras para desligar o alarme
-        if alarme_porta_ativo or alarme_temp_ativo:
-            if porta_fechada and (delta_t < LIMITE_VARIACAO_TEMP_C):
-                print("Status: Sistema Normalizado.")
-                alarme_porta_ativo = False
-                alarme_temp_ativo = False
-                # Reseta a referência térmica para o ambiente atual normalizado
-                temp_referencia = ler_temperatura()
+    def _verificar_normalizacao(self, porta_fechada, delta_t, temp_atual, agora_ms):
+        sistema_em_alarme = self.alarme_porta_ativo or self.alarme_temp_ativo
+        condicoes_normais = porta_fechada and (delta_t < LIMITE_VARIACAO_TEMP_C)
 
-        # Ciclo de delay muito rápido e não-bloqueante (100ms)
-        time.sleep_ms(100)
+        if sistema_em_alarme and condicoes_normais:
+            print("Status: Sistema Normalizado.")
+            self.alarme_porta_ativo = False
+            self.alarme_temp_ativo = False
+            self._temp_referencia = temp_atual  # reaproveita leitura ja feita nesta iteracao
+            # Reforca a msg por mais um tempo: cobre o caso de o teste comecar
+            # a escutar o serial pouco depois do evento e perder a 1a impressao.
+            self._fim_eco_normalizado_ms = time.ticks_add(agora_ms, JANELA_ECO_NORMALIZACAO_MS)
+        elif not sistema_em_alarme and time.ticks_diff(self._fim_eco_normalizado_ms, agora_ms) > 0:
+            print("Status: Sistema Normalizado.")
+
+    def atualizar(self):
+        agora_ms = time.ticks_ms()
+        porta_fechada = (self._botao.value() == 1)
+        temp_atual = self._sensor.ler_celsius()  # unica leitura I2C da iteracao
+
+        self._atualizar_referencia(temp_atual, agora_ms)
+        delta_t = temp_atual - self._temp_referencia
+
+        self._verificar_alarme_porta(porta_fechada, agora_ms)
+        self._verificar_alarme_temperatura(delta_t)
+        self._verificar_normalizacao(porta_fechada, delta_t, temp_atual, agora_ms)
+
+
+# ==========================================
+# PONTO DE ENTRADA
+# ==========================================
+def main():
+    botao = machine.Pin(PINO_BOTAO, machine.Pin.IN, machine.Pin.PULL_DOWN)
+
+    pino_scl = machine.Pin(PINO_SCL, pull=machine.Pin.PULL_UP)  # pull-ups evitam
+    pino_sda = machine.Pin(PINO_SDA, pull=machine.Pin.PULL_UP)  # ETIMEDOUT/ENODEV no I2C
+    i2c = machine.SoftI2C(scl=pino_scl, sda=pino_sda, freq=I2C_FREQ_HZ)
+
+    sensor = SensorTemperatura(i2c)
+    sensor.inicializar()
+
+    monitor = MonitorAmbiente(sensor, botao)
+
+    print("Sistema de Monitoramento Inicializado")  # obrigatoria: dispara os testes do CI
+    monitor.iniciar_calibracao(time.ticks_ms())
+
+    while True:
+        monitor.atualizar()
+        time.sleep_ms(INTERVALO_LOOP_MS)
+
 
 if __name__ == '__main__':
     main()

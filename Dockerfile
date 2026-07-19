@@ -7,7 +7,7 @@ ENV IDF_PATH="/opt/esp/idf/"
 WORKDIR "/"
 
 # RUN mkdir -p /fs
-COPY src/main.py /main.py
+COPY src/* /
 # COPY boot.py /boot.py
 
 RUN git clone https://github.com/earlephilhower/mklittlefs.git && \
